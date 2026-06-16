@@ -56,11 +56,32 @@ CLIENT_DEVICE_MODEL = "AutoCast"
 CLIENT_SYSTEM_VERSION = "Railway"
 CLIENT_APP_VERSION = "2.0"
 
+# ── Proxy config (optional) ──────────────────────────────────────────────────
+_proxy_host   = os.environ.get("PROXY_HOST")
+_proxy_port   = os.environ.get("PROXY_PORT")
+_proxy_user   = os.environ.get("PROXY_USER")
+_proxy_pass   = os.environ.get("PROXY_PASS")
+_proxy_scheme = os.environ.get("PROXY_SCHEME", "socks5")
+
+_proxy_dict = None
+if _proxy_host and _proxy_port:
+    _proxy_dict = {
+        "scheme":   _proxy_scheme,
+        "hostname": _proxy_host,
+        "port":     int(_proxy_port),
+        "username": _proxy_user,
+        "password": _proxy_pass,
+    }
+    logger.info(f"🌐 Proxy enabled: {_proxy_scheme}://{_proxy_host}:{_proxy_port}")
+else:
+    logger.info("🌐 No proxy configured — connecting directly.")
+
 app = Client(
     "autocast_v2",
     api_id=API_ID,
     api_hash=API_HASH,
-    bot_token=BOT_TOKEN
+    bot_token=BOT_TOKEN,
+    proxy=_proxy_dict,
 )
 scheduler  = None
 db_pool    = None
@@ -3829,30 +3850,3 @@ async def main():
 
     global scheduler
     await init_db()
-    await migrate_to_v11()
-
-    scheduler = AsyncIOScheduler(
-        timezone=pytz.utc,
-        event_loop=asyncio.get_running_loop(),
-        executors={"default": AsyncIOExecutor()},
-        job_defaults={"coalesce": True, "max_instances": 1, "misfire_grace_time": 3600}
-    )
-    scheduler.start()
-
-    try:
-        tasks = await get_all_tasks()
-        logger.info(f"📂 Reloading {len(tasks)} tasks from DB")
-        for t in tasks:
-            try: add_scheduler_job(t)
-            except Exception as e: logger.error(f"Failed to reload task {t['task_id']}: {e}")
-    except Exception as e:
-        logger.error(f"Startup task reload failed: {e}")
-
-    await app.start()
-    logger.info("🤖 AutoCast bot started.")
-    await idle()
-    await app.stop()
-    logger.info("🛑 AutoCast bot stopped.")
-
-if __name__ == "__main__":
-    app.run(main())
