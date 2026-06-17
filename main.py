@@ -76,13 +76,15 @@ if _proxy_host and _proxy_port:
 else:
     logger.info("🌐 No proxy configured — connecting directly.")
 
-app = Client(
-    "autocast_v2",
+_client_kwargs = dict(
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    proxy=_proxy_dict,
 )
+if _proxy_dict:
+    _client_kwargs["proxy"] = _proxy_dict
+
+app = Client("autocast_v2", **_client_kwargs)
 scheduler  = None
 db_pool    = None
 
@@ -3850,3 +3852,30 @@ async def main():
 
     global scheduler
     await init_db()
+    await migrate_to_v11()
+
+    scheduler = AsyncIOScheduler(
+        timezone=pytz.utc,
+        event_loop=asyncio.get_running_loop(),
+        executors={"default": AsyncIOExecutor()},
+        job_defaults={"coalesce": True, "max_instances": 1, "misfire_grace_time": 3600}
+    )
+    scheduler.start()
+
+    try:
+        tasks = await get_all_tasks()
+        logger.info(f"📂 Reloading {len(tasks)} tasks from DB")
+        for t in tasks:
+            try: add_scheduler_job(t)
+            except Exception as e: logger.error(f"Failed to reload task {t['task_id']}: {e}")
+    except Exception as e:
+        logger.error(f"Startup task reload failed: {e}")
+
+    await app.start()
+    logger.info("🤖 AutoCast bot started.")
+    await idle()
+    await app.stop()
+    logger.info("🛑 AutoCast bot stopped.")
+
+if __name__ == "__main__":
+    app.run(main())
