@@ -3878,3 +3878,14 @@ async def main():
     await app.start()
     logger.info("🤖 AutoCast bot started.")
     await idle()
+    await app.stop()
+    logger.info("🛑 AutoCast bot stopped.")
+
+if __name__ == "__main__":
+    import traceback
+    try:
+        app.run(main())
+    except Exception as _fatal:
+        print(f"\n💥 FATAL: {type(_fatal).__name__}: {_fatal}", flush=True)
+        traceback.print_exc()
+        sys.exit(1)
