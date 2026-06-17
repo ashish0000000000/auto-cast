@@ -260,6 +260,8 @@ def _build_user_client(*, session_string: str | None = None) -> Client:
         system_version=CLIENT_SYSTEM_VERSION,
         app_version=CLIENT_APP_VERSION,
     )
+    if _proxy_dict:
+        kwargs["proxy"] = _proxy_dict
     return Client(":memory:", **kwargs)
 
 def _build_login_client() -> Client:
@@ -275,6 +277,8 @@ def _build_login_client() -> Client:
         system_version=CLIENT_SYSTEM_VERSION,
         app_version=CLIENT_APP_VERSION,
     )
+    if _proxy_dict:
+        kwargs["proxy"] = _proxy_dict
     return Client(":memory:", **kwargs)
 
 def _parse_interval_minutes(interval_str: str | None) -> int | None:
@@ -3874,8 +3878,3 @@ async def main():
     await app.start()
     logger.info("🤖 AutoCast bot started.")
     await idle()
-    await app.stop()
-    logger.info("🛑 AutoCast bot stopped.")
-
-if __name__ == "__main__":
-    app.run(main())
