@@ -63,18 +63,43 @@ _proxy_user   = os.environ.get("PROXY_USER")
 _proxy_pass   = os.environ.get("PROXY_PASS")
 _proxy_scheme = os.environ.get("PROXY_SCHEME", "socks5")
 
-_proxy_dict = None
+def _can_reach_telegram_direct(timeout: float = 6.0) -> bool:
+    """Synchronous connectivity check -- runs before the event loop starts."""
+    try:
+        import urllib.request
+        urllib.request.urlopen("https://api.telegram.org", timeout=timeout)
+        return True
+    except Exception:
+        return False
+
+
+_proxy_dict_configured = None
 if _proxy_host and _proxy_port:
-    _proxy_dict = {
+    _proxy_dict_configured = {
         "scheme":   _proxy_scheme,
         "hostname": _proxy_host,
         "port":     int(_proxy_port),
         "username": _proxy_user,
         "password": _proxy_pass,
     }
-    logger.info(f"🌐 Proxy enabled: {_proxy_scheme}://{_proxy_host}:{_proxy_port}")
+
+# Auto-proxy detection: only use proxy when Telegram is not directly reachable.
+_proxy_status = "Direct (no proxy configured)"
+_proxy_dict = None
+if _proxy_dict_configured:
+    logger.info("Proxy configured -- checking direct Telegram connectivity...")
+    if _can_reach_telegram_direct():
+        logger.info("Telegram reachable directly -- skipping proxy.")
+        _proxy_dict = None
+        _proxy_status = "Direct (proxy bypassed -- Telegram reachable from server)"
+    else:
+        logger.info(f"Telegram not reachable directly -- using proxy {_proxy_scheme}://{_proxy_host}:{_proxy_port}.")
+        _proxy_dict = _proxy_dict_configured
+        _proxy_status = f"Proxy active ({_proxy_scheme}://{_proxy_host}:{_proxy_port})"
 else:
-    logger.info("🌐 No proxy configured — connecting directly.")
+    logger.info("No proxy configured -- connecting directly.")
+
+logger.info(f"Connection: {_proxy_status}")
 
 _client_kwargs = dict(
     api_id=API_ID,
@@ -1937,6 +1962,21 @@ async def get_delete_before_kb(temp_task_id):
 # ─────────────────────────────────────────────────────────────────────────────
 #  BOT COMMANDS
 # ─────────────────────────────────────────────────────────────────────────────
+@app.on_message(filters.private & filters.command(["proxy", "connection"]))
+async def cmd_proxy_status(client, m: Message):
+    """Show proxy / connection status."""
+    detail = ""
+    if _proxy_dict_configured:
+        d = _proxy_dict_configured
+        detail = (
+            f"\n\nConfigured: {d['scheme']}://{d['hostname']}:{d['port']}"
+            f"\nEffective: {'Bypassed (direct)' if not _proxy_dict else 'Active'}"
+        )
+    await m.reply(
+        f"Connection Status\n\n{_proxy_status}{detail}"
+    )
+
+
 @app.on_message(filters.command(["start", "manage"]))
 async def start_cmd(c, m):
     uid = m.from_user.id
