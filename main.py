@@ -3342,6 +3342,10 @@ async def update_task_logic(uid, q):
         "reply_target":       task.get("reply_target"),
         "src_chat_id":        st.get("src_chat_id",  task.get("src_chat_id", 0)),
         "src_msg_id":         st.get("src_msg_id",   task.get("src_msg_id", 0)),
+        # FIX PAUSED STATE: preserve is_paused so add_scheduler_job re-pauses
+        # the APScheduler job after an edit -- without this the scheduler job
+        # resumes firing even though the task is still marked paused in the DB.
+        "is_paused":          bool(task.get("is_paused", False)),
     }
 
     await save_task(updated)
@@ -3421,7 +3425,13 @@ async def create_task_logic(uid, q):
             except Exception as e:
                 logger.error(f"Failed to create task {tid}: {e}")
 
-    for key in ("broadcast_targets", "broadcast_queue", "auto_delete_offset"):
+    # FIX STEP CLEAR: reset all wizard keys so stray messages after scheduling
+    # don't re-enter waiting_broadcast_content / waiting_content flows, which
+    # would try to add posts to a now-empty queue with cleared targets.
+    for key in ("broadcast_targets", "broadcast_queue", "auto_delete_offset",
+                "step", "target", "content_type", "content_text", "file_id",
+                "entities", "pin", "del", "interval", "start_time",
+                "src_chat_id", "src_msg_id", "reply_to_channel_msg_id"):
         user_state[uid].pop(key, None)
 
     await update_menu(
@@ -3432,7 +3442,8 @@ async def create_task_logic(uid, q):
         f"📅 **First Send:** `{t_str}`\n"
         f"🔁 **Repeat:** `{interval or 'Once'}`\n\n"
         f"Use /manage to schedule more.",
-        None, uid, force_new=False
+        [[InlineKeyboardButton("🏠 Home", callback_data="menu_home")]],
+        uid, force_new=False
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3828,9 +3839,19 @@ async def _run_job(tid: str):
                 logger.info(f"Job {tid}: sent msg {sent.id}")
                 if fresh["pin"]:
                     try:
-                        pin_notif = await sent.pin()
+                        # FIX PIN: call pin_chat_message explicitly on the user
+                        # client instead of sent.pin(), which relies on
+                        # sent._client -- that attribute can point to the wrong
+                        # client (e.g. the bot 'app') when multiple Pyrogram
+                        # clients run concurrently, silently skipping the pin.
+                        pin_notif = await user.pin_chat_message(
+                            target_int, sent.id, disable_notification=False
+                        )
                         if isinstance(pin_notif, Message):
-                            await pin_notif.delete()
+                            try:
+                                await user.delete_messages(target_int, pin_notif.id)
+                            except Exception:
+                                pass  # deleting the service notification is best-effort
                     except Exception as e:
                         logger.warning(f"Job {tid}: pin failed: {e}")
 
@@ -3857,8 +3878,33 @@ async def _run_job(tid: str):
         wait_secs = e.value + 5
         logger.warning(f"Job {tid}: FloodWait {e.value}s — rescheduling in {wait_secs}s")
         retry_at = datetime.datetime.now(pytz.utc) + datetime.timedelta(seconds=wait_secs)
+        # FIX FLOODWAIT LOCK: acquire the same advisory lock as job_func so a
+        # multi-instance deployment can't run two retries simultaneously and
+        # produce duplicate sends.  Without this, _run_job was called directly
+        # and the PostgreSQL advisory lock was completely bypassed on retry.
         async def _fw_retry(_tid=tid):
-            await _run_job(_tid)
+            pool = await get_db()
+            lock_key = int.from_bytes(
+                hashlib.sha256(_tid.encode()).digest()[:4], 'big'
+            ) & 0x7FFFFFFF
+            async with pool.acquire() as lock_conn:
+                got_lock = await lock_conn.fetchval(
+                    "SELECT pg_try_advisory_lock($1)", lock_key
+                )
+                if not got_lock:
+                    logger.info(
+                        f"FW retry {_tid}: skipped -- advisory lock held by another instance"
+                    )
+                    return
+                try:
+                    await _run_job(_tid)
+                finally:
+                    try:
+                        await lock_conn.execute(
+                            "SELECT pg_advisory_unlock($1)", lock_key
+                        )
+                    except Exception:
+                        pass
         try:
             scheduler.add_job(
                 _fw_retry,
