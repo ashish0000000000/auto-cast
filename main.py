@@ -380,6 +380,24 @@ async def init_db():
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             );
         """)
+        # FIX PIN/AUTO-DELETE PERSISTENCE: pin retries and auto-delete jobs
+        # used to live only in APScheduler's in-memory job store. A restart
+        # (deploy, crash, Railway redeploy) between "message sent" and
+        # "message pinned / message auto-deleted" silently wiped these jobs
+        # forever -- there was no record anywhere that they were ever due.
+        # This table tracks every outstanding pin/delete action so it can be
+        # reloaded and re-scheduled on startup instead of being lost.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS userbot_pending_actions (
+                task_id    TEXT,
+                owner_id   BIGINT,
+                chat_id    TEXT,
+                message_id BIGINT,
+                action     TEXT,
+                run_at     TIMESTAMPTZ,
+                PRIMARY KEY (chat_id, message_id, action)
+            );
+        """)
         for sql in [
             "ALTER TABLE userbot_tasks_v11 ADD COLUMN IF NOT EXISTS auto_delete_offset INTEGER DEFAULT 0",
             "ALTER TABLE userbot_tasks_v11 ADD COLUMN IF NOT EXISTS reply_target TEXT",
@@ -851,6 +869,37 @@ async def clear_db_data(user_id):
     _user_last_seen.pop(user_id, None)
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  PENDING ACTION PERSISTENCE
+#  FIX PIN/AUTO-DELETE PERSIST: pin and auto-delete follow-up jobs previously
+#  lived only inside APScheduler's in-memory job store. Any restart between
+#  "message sent" and "pin / auto-delete due" silently and permanently lost
+#  the action -- nothing in the DB ever recorded it was pending, so nothing
+#  reloaded it. These helpers back every outstanding pin/delete action with a
+#  DB row so main() can reschedule it after any restart (see FIX PENDING
+#  RELOAD in main()).
+# ─────────────────────────────────────────────────────────────────────────────
+async def add_pending_action(task_id, owner_id, chat_id, message_id, action, run_at):
+    pool = await get_db()
+    await pool.execute("""
+        INSERT INTO userbot_pending_actions
+            (task_id, owner_id, chat_id, message_id, action, run_at)
+        VALUES ($1,$2,$3,$4,$5,$6)
+        ON CONFLICT (chat_id, message_id, action) DO UPDATE
+            SET run_at=$6, task_id=$1, owner_id=$2
+    """, task_id, owner_id, str(chat_id), int(message_id), action, run_at)
+
+async def remove_pending_action(chat_id, message_id, action):
+    pool = await get_db()
+    await pool.execute(
+        "DELETE FROM userbot_pending_actions WHERE chat_id=$1 AND message_id=$2 AND action=$3",
+        str(chat_id), int(message_id), action
+    )
+
+async def get_all_pending_actions():
+    pool = await get_db()
+    return [dict(r) for r in await pool.fetch("SELECT * FROM userbot_pending_actions")]
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  AUTO-DELETE HELPER
 # ─────────────────────────────────────────────────────────────────────────────
 async def delete_sent_message(owner_id, chat_id, message_id):
@@ -879,6 +928,85 @@ async def delete_sent_message(owner_id, chat_id, message_id):
         logger.warning(f"Auto-delete: invalid chat {chat_id}")
     except Exception as e:
         logger.error(f"Auto-delete error: {e}")
+    finally:
+        # Always clear the tracking row once this attempt has run (success or
+        # a definitive failure) so it isn't fired again after a restart.
+        try:
+            await remove_pending_action(chat_id, message_id, "delete")
+        except Exception:
+            pass
+
+async def pin_message_now(owner_id, chat_id, message_id, task_id=None, _attempt=1):
+    """
+    Pin a message using a fresh short-lived user-session client.
+
+    FIX PIN RELIABILITY: the previous implementation pinned inline inside
+    _run_job and, on ANY exception (including a plain FloodWait -- which is
+    routine and expected when several posts pin in quick succession), simply
+    logged a warning and gave up forever. That is the root cause of pins
+    "working in the UI" (the toggle and DB value were always correct) but
+    never actually landing in the channel: the single attempt failed once and
+    was never retried. This version retries automatically on FloodWait, and
+    persists the retry via userbot_pending_actions so it also survives a bot
+    restart while the retry is pending.
+    """
+    rescheduled = False
+    try:
+        session = await get_session(owner_id)
+        if not session:
+            return
+        chat_id_int = int(chat_id)
+        access_hash = await get_channel_access_hash(owner_id, str(chat_id))
+        async with _build_user_client(session_string=session) as user:
+            warmed = await _warm_peer_in_client(user, chat_id_int, access_hash)
+            if not warmed:
+                access_hash = await warm_peer_and_get_hash(user, owner_id, chat_id_int)
+                warmed = bool(access_hash) and await _warm_peer_in_client(user, chat_id_int, access_hash)
+            if not warmed:
+                logger.warning(f"Pin: could not resolve chat {chat_id} for msg {message_id}")
+                return
+            pin_notif = await user.pin_chat_message(
+                chat_id_int, message_id, disable_notification=False
+            )
+            if isinstance(pin_notif, Message):
+                try:
+                    await user.delete_messages(chat_id_int, pin_notif.id)
+                except Exception:
+                    pass  # deleting the service notification is best-effort
+            logger.info(f"📌 Pinned msg {message_id} in {chat_id}")
+    except errors.FloodWait as e:
+        wait_s = e.value + 2
+        if scheduler and _attempt <= 3:
+            retry_at = datetime.datetime.now(pytz.utc) + datetime.timedelta(seconds=wait_s)
+            try:
+                await add_pending_action(task_id, owner_id, chat_id, message_id, "pin", retry_at)
+                scheduler.add_job(
+                    pin_message_now, "date", run_date=retry_at,
+                    args=[owner_id, chat_id, message_id, task_id, _attempt + 1],
+                    id=f"pinretry_{chat_id}_{message_id}",
+                    replace_existing=True, misfire_grace_time=300
+                )
+                rescheduled = True
+                logger.warning(
+                    f"Pin: FloodWait {e.value}s on msg {message_id} in {chat_id} "
+                    f"— retry #{_attempt} scheduled at {retry_at.isoformat()}"
+                )
+            except Exception as sched_err:
+                logger.error(f"Pin: failed to schedule retry for msg {message_id}: {sched_err}")
+        else:
+            logger.warning(
+                f"Pin: giving up on msg {message_id} in {chat_id} after repeated FloodWait"
+            )
+    except (errors.ChatAdminRequired, errors.ChatNotModified) as e:
+        logger.warning(f"Pin: not permitted / nothing to change in {chat_id}: {e}")
+    except Exception as e:
+        logger.warning(f"Pin: failed for msg {message_id} in {chat_id}: {e}")
+    finally:
+        if not rescheduled:
+            try:
+                await remove_pending_action(chat_id, message_id, "pin")
+            except Exception:
+                pass
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  SERIALIZATION
@@ -1234,8 +1362,6 @@ async def _stage_bot_message_media(uid: int, message: Message,
     except Exception as e:
         logger.warning(f"Media staging upload failed uid={uid} ct={content_type}: {e}")
         return None
-
-
 async def export_user_config(uid: int) -> dict:
     """
     FIX 13 (export side): reply_target that references another task is stored as
@@ -2777,7 +2903,6 @@ async def _handle_callback(c, q, uid, d):
 
     else:
         await q.answer("Unknown action.", show_alert=False)
-
 # ─────────────────────────────────────────────────────────────────────────────
 #  MESSAGE HANDLER
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3631,7 +3756,29 @@ async def _run_job(tid: str):
                 except (errors.MessageDeleteForbidden, errors.MessageIdInvalid):
                     pass
                 except Exception as e:
-                    logger.warning(f"Job {tid}: delete old failed: {e}")
+                    # FIX DELETE-OLD ORPHAN: previously any failure here (a
+                    # FloodWait, a transient network error, etc.) just logged
+                    # a warning and moved on. Because last_msg_id gets
+                    # overwritten with the *new* message right after sending,
+                    # that old message was never referenced again and stayed
+                    # in the channel forever -- "delete previous" silently
+                    # skipping. Now we schedule a standalone retry (persisted
+                    # so it survives a restart too) instead of abandoning it.
+                    logger.warning(f"Job {tid}: delete old failed ({e}) — scheduling retry")
+                    try:
+                        retry_at = datetime.datetime.now(pytz.utc) + datetime.timedelta(minutes=2)
+                        await add_pending_action(
+                            tid, fresh["owner_id"], fresh["chat_id"],
+                            fresh["last_msg_id"], "delete", retry_at
+                        )
+                        scheduler.add_job(
+                            delete_sent_message, "date", run_date=retry_at,
+                            args=[fresh["owner_id"], fresh["chat_id"], fresh["last_msg_id"]],
+                            id=f"delold_{tid}_{fresh['last_msg_id']}",
+                            replace_existing=True, misfire_grace_time=300
+                        )
+                    except Exception as sched_err:
+                        logger.error(f"Job {tid}: failed to schedule delete-old retry: {sched_err}")
 
             if fresh.get("reply_target"):
                 ref_val = str(fresh["reply_target"]).strip()
@@ -3838,22 +3985,12 @@ async def _run_job(tid: str):
             if sent:
                 logger.info(f"Job {tid}: sent msg {sent.id}")
                 if fresh["pin"]:
-                    try:
-                        # FIX PIN: call pin_chat_message explicitly on the user
-                        # client instead of sent.pin(), which relies on
-                        # sent._client -- that attribute can point to the wrong
-                        # client (e.g. the bot 'app') when multiple Pyrogram
-                        # clients run concurrently, silently skipping the pin.
-                        pin_notif = await user.pin_chat_message(
-                            target_int, sent.id, disable_notification=False
-                        )
-                        if isinstance(pin_notif, Message):
-                            try:
-                                await user.delete_messages(target_int, pin_notif.id)
-                            except Exception:
-                                pass  # deleting the service notification is best-effort
-                    except Exception as e:
-                        logger.warning(f"Job {tid}: pin failed: {e}")
+                    # FIX PIN RELIABILITY: pinning now goes through
+                    # pin_message_now(), which retries automatically on
+                    # FloodWait instead of dropping the pin after a single
+                    # failed attempt (see definition above for why this was
+                    # the actual root cause of "pin is on but never happens").
+                    await pin_message_now(fresh["owner_id"], target_int, sent.id, task_id=tid)
 
                 await update_last_msg(tid, sent.id)
 
@@ -3861,6 +3998,13 @@ async def _run_job(tid: str):
                 if off and off > 0:
                     try:
                         run_at = datetime.datetime.now(pytz.utc) + datetime.timedelta(minutes=off)
+                        # FIX AUTO-DELETE PERSIST: record the pending delete in
+                        # the DB (not just APScheduler's in-memory job store) so
+                        # a restart before run_at can't silently drop it — see
+                        # the pending-action reload in main().
+                        await add_pending_action(
+                            tid, fresh["owner_id"], fresh["chat_id"], sent.id, "delete", run_at
+                        )
                         scheduler.add_job(
                             delete_sent_message, "date", run_date=run_at,
                             args=[fresh["owner_id"], fresh["chat_id"], sent.id],
@@ -3960,6 +4104,48 @@ async def main():
             except Exception as e: logger.error(f"Failed to reload task {t['task_id']}: {e}")
     except Exception as e:
         logger.error(f"Startup task reload failed: {e}")
+
+    # FIX PENDING RELOAD: reschedule every pin / auto-delete action that was
+    # still outstanding when the process last stopped. Without this, any
+    # restart (deploy, crash, platform redeploy) between "message sent" and
+    # "pin/auto-delete due" permanently dropped that action — this is the
+    # main reason pin and auto-delete looked correctly configured in the UI
+    # but silently never happened.
+    try:
+        pending = await get_all_pending_actions()
+        now_u = datetime.datetime.now(pytz.utc)
+        for pa in pending:
+            run_at = pa["run_at"]
+            if run_at is None:
+                continue
+            if run_at.tzinfo is None:
+                run_at = pytz.utc.localize(run_at)
+            # If we were offline past the due time, fire it almost immediately
+            # instead of dropping it.
+            fire_at = run_at if run_at > now_u else now_u + datetime.timedelta(seconds=3)
+            try:
+                if pa["action"] == "delete":
+                    scheduler.add_job(
+                        delete_sent_message, "date", run_date=fire_at,
+                        args=[pa["owner_id"], pa["chat_id"], pa["message_id"]],
+                        id=f"del_{pa['task_id']}_{pa['message_id']}",
+                        replace_existing=True, misfire_grace_time=300
+                    )
+                elif pa["action"] == "pin":
+                    scheduler.add_job(
+                        pin_message_now, "date", run_date=fire_at,
+                        args=[pa["owner_id"], pa["chat_id"], pa["message_id"], pa["task_id"], 1],
+                        id=f"pinretry_{pa['chat_id']}_{pa['message_id']}",
+                        replace_existing=True, misfire_grace_time=300
+                    )
+            except Exception as e:
+                logger.error(
+                    f"Failed to reschedule pending {pa.get('action')} "
+                    f"for msg {pa.get('message_id')}: {e}"
+                )
+        logger.info(f"🔁 Reloaded {len(pending)} pending pin/auto-delete action(s) from DB")
+    except Exception as e:
+        logger.error(f"Startup pending-action reload failed: {e}")
 
     await app.start()
     logger.info("🤖 AutoCast bot started.")
