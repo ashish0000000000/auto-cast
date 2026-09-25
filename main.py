@@ -21,7 +21,7 @@ from apscheduler.triggers.date import DateTrigger
 from apscheduler.executors.asyncio import AsyncIOExecutor
 from pyrogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
-    Message, MessageEntity,
+    Message, MessageEntity, PollOption,
     ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 )
 
@@ -586,51 +586,77 @@ async def get_channel_access_hash(user_id, channel_id: str) -> int:
     return row["access_hash"] if row and row["access_hash"] else 0
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  FIX 6 — warm_peer_and_get_hash: try get_chat() first, fall back to dialogs
-#  The original always scanned all dialogs — this reduces API usage dramatically
-#  for common cases where the channel is resolvable directly.
+#  FIX 6 (CORRECTED) — warm_peer_and_get_hash
+#
+#  ROOT-CAUSE FIX for "❌ Channel not found in your dialogs" (even as admin) and
+#  for scheduled posts auto-pausing with a bogus "no longer an admin" notice.
+#
+#  The previous version read the peer's access_hash via
+#      getattr(chat, "access_hash", 0)   /   getattr(dialog.chat, "access_hash", 0)
+#  but pyrofork's high-level `Chat` object has NO `access_hash` attribute (it
+#  exists only on the raw layer). So getattr always returned 0 → this function
+#  always returned 0 → callers concluded the channel was unreachable, regardless
+#  of real membership/admin status.
+#
+#  The correct source of a channel's access_hash is client.resolve_peer(), which
+#  returns a raw InputPeerChannel carrying the real access_hash — but only once
+#  the peer is in the client's storage. A client built fresh from a session
+#  string starts with an EMPTY peer store, so we warm it first (get_chat, or a
+#  dialog scan that stores every peer it yields) and then resolve.
 # ─────────────────────────────────────────────────────────────────────────────
+async def _resolve_access_hash(user_client, channel_id: int) -> int:
+    """Return the real access_hash for channel_id from the client's peer
+    storage. Must be called after the peer has been warmed (get_chat succeeded,
+    or the channel appeared in a get_dialogs scan). Returns 0 if unresolved."""
+    try:
+        peer = await user_client.resolve_peer(channel_id)
+    except Exception:
+        return 0
+    return getattr(peer, "access_hash", 0) or 0
+
+async def _cache_access_hash(owner_id: int, channel_id: int, ah: int, source: str = ""):
+    if not ah:
+        return
+    try:
+        pool = await get_db()
+        await pool.execute(
+            "UPDATE userbot_channels SET access_hash=$1 "
+            "WHERE user_id=$2 AND channel_id=$3",
+            ah, owner_id, str(channel_id)
+        )
+        logger.info(f"✅ Cached access_hash for {channel_id} ({source}) owner={owner_id}")
+    except Exception as e:
+        logger.warning(f"Failed to cache access_hash for {channel_id}: {e}")
+
 async def warm_peer_and_get_hash(user_client, owner_id: int, channel_id: int,
                                   timeout: float = 25.0) -> int:
-    # Fast path: try get_chat directly (works if peer is already in Pyrogram's cache
-    # or resolvable from the session)
-    try:
-        chat = await asyncio.wait_for(
-            user_client.get_chat(channel_id), timeout=8.0
-        )
-        ah = getattr(chat, "access_hash", 0) or 0
-        if ah:
-            pool = await get_db()
-            await pool.execute(
-                "UPDATE userbot_channels SET access_hash=$1 "
-                "WHERE user_id=$2 AND channel_id=$3",
-                ah, owner_id, str(channel_id)
-            )
-            logger.info(f"✅ Cached access_hash for {channel_id} (fast path) owner={owner_id}")
-            return ah
-    except (asyncio.TimeoutError, errors.PeerIdInvalid):
-        pass  # fall through to dialog scan
-    except Exception as e:
-        logger.debug(f"warm_peer fast path failed for {channel_id}: {e}")
+    async def _run() -> int:
+        # Fast path: get_chat resolves and warms the peer into storage; once it
+        # succeeds, resolve_peer yields the real access_hash. Cheap when the
+        # channel is directly resolvable, so it avoids a full dialog scan.
+        try:
+            await asyncio.wait_for(user_client.get_chat(channel_id), timeout=8.0)
+            ah = await _resolve_access_hash(user_client, channel_id)
+            if ah:
+                await _cache_access_hash(owner_id, channel_id, ah, "fast path")
+                return ah
+        except (asyncio.TimeoutError, errors.PeerIdInvalid, KeyError):
+            pass  # cold peer store — fall through to dialog scan
+        except Exception as e:
+            logger.debug(f"warm_peer fast path failed for {channel_id}: {e}")
 
-    # Slow path: scan dialogs in both main and archived folders
-    async def _scan():
+        # Slow path: scan dialogs in the main (0) and archived (1) folders.
+        # Iterating get_dialogs stores every peer it returns, so once our
+        # channel appears we can resolve its access_hash from storage.
         for folder_id in (0, 1):
             try:
                 async for dialog in user_client.get_dialogs(folder_id=folder_id):
                     if dialog.chat.id == channel_id:
-                        ah = getattr(dialog.chat, "access_hash", 0) or 0
-                        if ah:
-                            pool = await get_db()
-                            await pool.execute(
-                                "UPDATE userbot_channels SET access_hash=$1 "
-                                "WHERE user_id=$2 AND channel_id=$3",
-                                ah, owner_id, str(channel_id)
-                            )
-                            logger.info(
-                                f"✅ Cached access_hash for {channel_id} "
-                                f"(dialog scan folder={folder_id}) owner={owner_id}"
-                            )
+                        ah = await _resolve_access_hash(user_client, channel_id)
+                        await _cache_access_hash(
+                            owner_id, channel_id, ah,
+                            f"dialog scan folder={folder_id}"
+                        )
                         return ah
             except Exception as e:
                 logger.warning(
@@ -640,7 +666,7 @@ async def warm_peer_and_get_hash(user_client, owner_id: int, channel_id: int,
         return 0
 
     try:
-        return await asyncio.wait_for(_scan(), timeout=timeout)
+        return await asyncio.wait_for(_run(), timeout=timeout)
     except asyncio.TimeoutError:
         logger.warning(f"warm_peer timed out after {timeout}s for channel {channel_id}")
         return 0
@@ -1708,19 +1734,26 @@ async def import_user_config(uid: int, data: dict,
         ah_map: dict[int, int] = {}
         if user_client_ctx and channels:
             await _progress(f"⏳ Scanning your dialogs to resolve {len(channels)} channel(s)…")
+            # Warm every peer into the client's storage via a dialog scan across
+            # the main (0) and archive (1) folders. We do NOT read access_hash
+            # off dialog.chat — the high-level Chat object never carries it; the
+            # real hash comes from resolve_peer() once the peer is in storage.
             for folder_id in (0, 1):           # 0 = main inbox, 1 = archive
                 try:
-                    async for dialog in user_client_ctx.get_dialogs(folder_id=folder_id):
-                        try:
-                            cid_d = dialog.chat.id
-                            ah_d  = getattr(dialog.chat, "access_hash", 0) or 0
-                            if ah_d:
-                                ah_map[cid_d] = ah_d
-                        except Exception:
-                            continue          # bad dialog entry — skip, don't abort
+                    async for _dialog in user_client_ctx.get_dialogs(folder_id=folder_id):
+                        pass                   # side effect: peer cached in storage
                 except Exception as e:
                     logger.warning(f"Import dialog scan folder={folder_id} uid={uid}: {e}")
-            logger.info(f"Import uid={uid}: dialog scan found {len(ah_map)} peer(s) (main+archive)")
+            # Resolve the real access_hash for each backup channel from storage.
+            for _ch in channels:
+                try:
+                    _cid = int(_ch["channel_id"])
+                except (KeyError, ValueError, TypeError):
+                    continue
+                _ah = await _resolve_access_hash(user_client_ctx, _cid)
+                if _ah:
+                    ah_map[_cid] = _ah
+            logger.info(f"Import uid={uid}: resolved {len(ah_map)} peer(s) (main+archive)")
 
         for ch in channels:
             cid_str = str(ch["channel_id"])
@@ -1735,15 +1768,16 @@ async def import_user_config(uid: int, data: dict,
             if not ah:
                 ah = ah_map.get(cid_int, 0)
 
-            # Tier 2: single get_chat() call (works if peer was cached during scan)
+            # Tier 2: force-fetch via get_chat (warms the peer), then resolve
+            # its real access_hash from storage.
             if not ah and user_client_ctx:
                 try:
                     chat = await asyncio.wait_for(
                         user_client_ctx.get_chat(cid_int), timeout=8.0
                     )
-                    ah = getattr(chat, "access_hash", 0) or 0
                     if getattr(chat, "title", None):
                         title = chat.title
+                    ah = await _resolve_access_hash(user_client_ctx, cid_int)
                 except Exception as e:
                     logger.debug(f"import get_chat {cid_str}: {e}")
 
@@ -3433,10 +3467,27 @@ def _extract_file_id(m):
     if m.sticker:   return m.sticker.file_id
     return None
 
+def _capture_content_text(m):
+    """Return the storable text body of a message. A poll message has no
+    caption or text, so its question + options are serialised to JSON — which
+    is exactly what the poll send path in _run_job expects (json.loads(caption)).
+    Without this, poll tasks were stored with content_text=None and then
+    crashed at send time."""
+    poll = getattr(m, "poll", None)
+    if poll:
+        try:
+            return json.dumps({
+                "question": poll.question,
+                "options": [opt.text for opt in poll.options],
+            })
+        except Exception:
+            pass
+    return m.caption or m.text
+
 async def process_content_message(c, m, uid):
     st = user_state[uid]
     st["content_type"] = m.media.value if m.media else "text"
-    st["content_text"] = m.caption or m.text
+    st["content_text"] = _capture_content_text(m)
     st["file_id"]      = _extract_file_id(m)
     st["entities"]     = serialize_entities(m.caption_entities or m.entities)
     st["input_msg_id"] = m.id
@@ -3466,7 +3517,7 @@ async def process_broadcast_content_message(c, m, uid):
     queue = st.get("broadcast_queue", [])
     post  = {
         "content_type":       m.media.value if m.media else "text",
-        "content_text":       m.caption or m.text,
+        "content_text":       _capture_content_text(m),
         "file_id":            _extract_file_id(m),
         "entities":           serialize_entities(m.caption_entities or m.entities),
         "input_msg_id":       m.id,
@@ -3535,7 +3586,7 @@ async def process_content_edit_message(c, m, uid):
         await m.reply("❌ No task selected for editing.")
         return
     st["content_type"] = m.media.value if m.media else "text"
-    st["content_text"] = m.caption or m.text
+    st["content_text"] = _capture_content_text(m)
     st["file_id"]      = _extract_file_id(m)
     st["entities"]     = serialize_entities(m.caption_entities or m.entities)
     st["src_chat_id"]  = m.chat.id
@@ -4013,9 +4064,17 @@ async def _run_job(tid: str):
                         disable_web_page_preview=True
                     )
                 elif ct == "poll":
-                    pd = json.loads(caption)
+                    # pyrofork's send_poll expects options as PollOption objects
+                    # (it reads option.text/.entities), not plain strings, so
+                    # convert stored strings before sending.
+                    pd = json.loads(caption) if caption else {}
+                    poll_q = pd.get("question") or " "
+                    poll_opts = [
+                        o if isinstance(o, PollOption) else PollOption(text=str(o))
+                        for o in (pd.get("options") or [])
+                    ]
                     sent = await user.send_poll(
-                        target_int, pd["question"], pd["options"],
+                        target_int, poll_q, poll_opts,
                         reply_to_message_id=reply_id
                     )
                 elif ct == "photo":
