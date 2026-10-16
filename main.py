@@ -327,7 +327,11 @@ async def get_db():
         _db_init_lock = asyncio.Lock()
     async with _db_init_lock:
         if not db_pool:
-            db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
+            db_pool = await asyncpg.create_pool(
+                DATABASE_URL, min_size=2, max_size=10,
+                timeout=30, command_timeout=60,
+                max_inactive_connection_lifetime=240,
+            )
     return db_pool
 
 async def init_db():
@@ -4321,6 +4325,66 @@ async def _run_job(tid: str):
             except Exception: pass
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  WATCHDOG — self-healing for silently dead connections
+#  Symptom fixed: bot shows "running" but stops answering after 1-2 days with no
+#  new logs (half-open TCP to Telegram / stale DB connections / frozen loop).
+#  If health checks keep failing, the process exits so Coolify's restart policy
+#  brings up a fresh container (same effect as a manual redeploy).
+# ─────────────────────────────────────────────────────────────────────────────
+import threading
+
+_loop_heartbeat = time.monotonic()
+_WD_INTERVAL    = int(os.environ.get("WATCHDOG_INTERVAL", "60"))
+_WD_MAX_FAILS   = int(os.environ.get("WATCHDOG_MAX_FAILS", "3"))
+_WD_FREEZE_SECS = int(os.environ.get("WATCHDOG_FREEZE_SECS", "300"))
+
+def _hard_exit(reason: str):
+    logger.critical(f"🐕 Watchdog: {reason} — exiting so the platform restarts the container.")
+    try:
+        sys.stdout.flush(); sys.stderr.flush()
+    except Exception:
+        pass
+    os._exit(1)
+
+def _start_freeze_monitor():
+    """Thread-based: catches a completely blocked/frozen event loop."""
+    def _run():
+        while True:
+            time.sleep(30)
+            stalled = time.monotonic() - _loop_heartbeat
+            if stalled > _WD_FREEZE_SECS:
+                _hard_exit(f"event loop frozen for {int(stalled)}s")
+    threading.Thread(target=_run, daemon=True, name="freeze-monitor").start()
+
+async def _watchdog():
+    global _loop_heartbeat
+    fails = 0
+    while True:
+        await asyncio.sleep(_WD_INTERVAL)
+        _loop_heartbeat = time.monotonic()
+        problem = None
+        try:
+            await asyncio.wait_for(app.get_me(), timeout=30)
+        except Exception as e:
+            problem = f"Telegram check failed: {type(e).__name__}: {e}"
+        if problem is None:
+            try:
+                pool = await get_db()
+                await asyncio.wait_for(pool.fetchval("SELECT 1"), timeout=20)
+            except Exception as e:
+                problem = f"DB check failed: {type(e).__name__}: {e}"
+        if problem:
+            fails += 1
+            logger.warning(f"🐕 Watchdog ({fails}/{_WD_MAX_FAILS}): {problem}")
+            if fails >= _WD_MAX_FAILS:
+                _hard_exit(problem)
+        else:
+            if fails:
+                logger.info("🐕 Watchdog: connection recovered.")
+            fails = 0
+            logger.info("💓 Watchdog: Telegram + DB healthy.") if int(time.time()) % 3600 < _WD_INTERVAL else None
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  STARTUP
 # ─────────────────────────────────────────────────────────────────────────────
 async def main():
@@ -4328,8 +4392,11 @@ async def main():
     _init_encryption()
 
     global scheduler
-    await init_db()
-    await migrate_to_v11()
+    try:
+        await asyncio.wait_for(init_db(), timeout=90)
+        await asyncio.wait_for(migrate_to_v11(), timeout=300)
+    except Exception as e:
+        _hard_exit(f"database startup failed/timed out: {type(e).__name__}: {e}")
 
     scheduler = AsyncIOScheduler(
         timezone=pytz.utc,
@@ -4390,8 +4457,15 @@ async def main():
     except Exception as e:
         logger.error(f"Startup pending-action reload failed: {e}")
 
-    await app.start()
-    logger.info("🤖 AutoCast bot started.")
+    logger.info("▶️  Connecting to Telegram...")
+    try:
+        await asyncio.wait_for(app.start(), timeout=120)
+    except Exception as e:
+        _hard_exit(f"app.start() failed/timed out: {type(e).__name__}: {e}")
+    me = await app.get_me()
+    logger.info(f"🤖 AutoCast bot started as @{me.username}.")
+    _start_freeze_monitor()
+    asyncio.create_task(_watchdog())
     await idle()
     await app.stop()
     logger.info("🛑 AutoCast bot stopped.")
