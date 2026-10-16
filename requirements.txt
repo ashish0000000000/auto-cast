@@ -1,4 +1,4 @@
-pyrofork
+pyrofork==2.3.69
 TgCrypto==1.2.2
 asyncpg==0.29.0
 APScheduler==3.10.4
