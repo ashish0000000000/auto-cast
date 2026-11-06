@@ -34,6 +34,34 @@ logging.basicConfig(
 logger = logging.getLogger("AutoCast")
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  FIX "RuntimeError: read() called while another coroutine is already waiting
+#  for incoming data"
+#  Pyrogram's Session.restart() has no guard. When a connection drops, the
+#  ping task, the network task and the packet handler can EACH schedule a
+#  restart at the same moment. Those restarts run concurrently, two receive
+#  loops end up reading the same socket, the RuntimeError above is raised, and
+#  the connection can flap or hang (which the watchdog then "fixes" by
+#  restarting the whole container). Only one restart per session may run at a
+#  time; duplicates are dropped because the running restart already covers them.
+# ─────────────────────────────────────────────────────────────────────────────
+from pyrogram.session import Session as _PyroSession
+
+_orig_session_restart = _PyroSession.restart
+
+async def _guarded_session_restart(self):
+    lock = self.__dict__.get("_ac_restart_lock")
+    if lock is None:
+        lock = self._ac_restart_lock = asyncio.Lock()
+    if lock.locked():
+        logger.info("Telegram session restart already in progress — duplicate restart skipped")
+        return
+    async with lock:
+        logger.warning("Telegram connection dropped — reconnecting session")
+        await _orig_session_restart(self)
+
+_PyroSession.restart = _guarded_session_restart
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  ENV / STARTUP
 # ─────────────────────────────────────────────────────────────────────────────
 def _require_env(key: str) -> str:
@@ -5090,6 +5118,89 @@ _WD_INTERVAL    = int(os.environ.get("WATCHDOG_INTERVAL", "60"))
 _WD_MAX_FAILS   = int(os.environ.get("WATCHDOG_MAX_FAILS", "3"))
 _WD_FREEZE_SECS = int(os.environ.get("WATCHDOG_FREEZE_SECS", "300"))
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  HEALTH (for Coolify's healthcheck)
+#  Coolify showed "Running (no healthcheck)": without a check, a rolling
+#  update can't wait for the new container to really be up before removing the
+#  old one, and a broken container still looks "Running".
+#
+#  1. Heartbeat file (always on, no port needed): written once the bot is fully
+#     started (DB up, Telegram connected, tasks loaded) and refreshed after every
+#     successful watchdog check. `python healthcheck.py` exits 0 only while it is
+#     fresh → use Coolify's CMD health check (works without curl/wget).
+#  2. Optional HTTP endpoint: set HEALTH_PORT (or PORT) to also serve /health
+#     (200 when healthy, 503 otherwise) for an HTTP-type check.
+# ─────────────────────────────────────────────────────────────────────────────
+HEALTH_FILE = os.environ.get("HEALTH_FILE", "/tmp/autocast.health")
+_health = {"ready": False, "last_ok": 0.0, "started": time.monotonic(), "stage": "starting"}
+_health_server = None
+
+def _write_heartbeat():
+    try:
+        tmp = HEALTH_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"ts": time.time(), "ready": _health["ready"],
+                       "stage": _health["stage"],
+                       "stale_after": max(3 * _WD_INTERVAL, 180)}, f)
+        os.replace(tmp, HEALTH_FILE)
+    except Exception as e:
+        logger.debug(f"heartbeat write failed: {e}")
+
+def _health_status() -> tuple[bool, dict]:
+    now = time.monotonic()
+    fresh = (now - _health["last_ok"]) < max(3 * _WD_INTERVAL, 180)
+    ok = bool(_health["ready"] and fresh)
+    return ok, {
+        "status": "ok" if ok else ("starting" if not _health["ready"] else "unhealthy"),
+        "stage": _health["stage"],
+        "uptime_s": int(now - _health["started"]),
+        "scheduled_jobs": len(scheduler.get_jobs()) if scheduler else 0,
+    }
+
+async def _health_handler(reader, writer):
+    try:
+        request_line = await asyncio.wait_for(reader.readline(), timeout=5)
+        for _ in range(100):                       # drain request headers
+            line = await asyncio.wait_for(reader.readline(), timeout=5)
+            if not line or line in (b"\r\n", b"\n"):
+                break
+        parts = request_line.decode("latin-1", "replace").split()
+        path = parts[1] if len(parts) > 1 else "/"
+        if path.split("?")[0] in ("/", "/health", "/healthz"):
+            ok, body = _health_status()
+            status = "200 OK" if ok else "503 Service Unavailable"
+        else:
+            status, body = "404 Not Found", {"error": "not found"}
+        data = json.dumps(body).encode()
+        writer.write(
+            f"HTTP/1.1 {status}\r\nContent-Type: application/json\r\n"
+            f"Content-Length: {len(data)}\r\nConnection: close\r\n\r\n".encode() + data
+        )
+        await writer.drain()
+    except Exception:
+        pass
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+async def _start_health_server():
+    global _health_server
+    _write_heartbeat()                              # "starting" (not ready yet)
+    port = os.environ.get("HEALTH_PORT") or os.environ.get("PORT")
+    if not port:
+        return
+    try:
+        _health_server = await asyncio.start_server(_health_handler, host=None, port=int(port))
+        logger.info(f"🩺 HTTP health endpoint on :{port}/health")
+    except Exception as e:
+        logger.warning(f"Could not start HTTP health endpoint on port {port}: {e}")
+
+def _mark_healthy():
+    _health["last_ok"] = time.monotonic()
+    _write_heartbeat()
+
 def _hard_exit(reason: str):
     logger.critical(f"🐕 Watchdog: {reason} — exiting so the platform restarts the container.")
     try:
@@ -5131,6 +5242,7 @@ async def _watchdog():
             if fails >= _WD_MAX_FAILS:
                 _hard_exit(problem)
         else:
+            _mark_healthy()
             if fails:
                 logger.info("🐕 Watchdog: connection recovered.")
             fails = 0
@@ -5142,6 +5254,8 @@ async def _watchdog():
 async def main():
     check_env_vars()
     _init_encryption()
+    await _start_health_server()
+    _health["stage"] = "database"
 
     global scheduler
     try:
@@ -5245,6 +5359,7 @@ async def main():
     except Exception as e:
         logger.error(f"Startup pending-action reload failed: {e}")
 
+    _health["stage"] = "telegram"
     logger.info("▶️  Connecting to Telegram...")
     try:
         await asyncio.wait_for(app.start(), timeout=120)
@@ -5252,6 +5367,8 @@ async def main():
         _hard_exit(f"app.start() failed/timed out: {type(e).__name__}: {e}")
     me = await app.get_me()
     logger.info(f"🤖 AutoCast bot started as @{me.username}.")
+    _health.update(ready=True, stage="running")
+    _mark_healthy()
     for t in missed_once:
         try:
             await _mark_missed_once(t)
@@ -5262,6 +5379,11 @@ async def main():
     _start_freeze_monitor()
     _bg_tasks = [asyncio.create_task(_watchdog()), asyncio.create_task(_maintenance_loop())]
     await idle()
+    logger.info("🛑 Shutdown signal received — stopping cleanly…")
+    _health.update(ready=False, stage="stopping")
+    _write_heartbeat()
+    if _health_server is not None:
+        _health_server.close()
     for bt in _bg_tasks:
         bt.cancel()
     try:
