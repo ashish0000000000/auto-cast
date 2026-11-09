@@ -1326,7 +1326,39 @@ async def get_all_pending_actions():
 # ─────────────────────────────────────────────────────────────────────────────
 #  AUTO-DELETE HELPER
 # ─────────────────────────────────────────────────────────────────────────────
-async def delete_sent_message(owner_id, chat_id, message_id):
+async def _auto_delete_find_repost(user, chat_id_int: int, message_id: int, task_id: str) -> int:
+    """
+    Auto-delete safety net: the message we scheduled for deletion is already
+    gone — a slow repost bot replaced it after AutoCast stopped watching — so
+    find that repost (posted after it, same content, around the time it was
+    sent) and delete it instead.
+    """
+    task = await get_single_task(task_id)
+    if not task:
+        return 0
+    off_min = int(task.get("auto_delete_offset") or 0)
+    sent_est = datetime.datetime.now() - datetime.timedelta(minutes=off_min)  # naive local, like msg.date
+    others = await _other_tracked_ids(chat_id_int, task_id)
+    try:
+        async for msg in user.get_chat_history(chat_id_int, limit=60):
+            if msg.id <= message_id:
+                break
+            if getattr(msg, "outgoing", False) or getattr(msg, "service", None) or msg.id in others:
+                continue
+            if msg.date:
+                delta = (msg.date - sent_est).total_seconds()
+                if not (-900 <= delta <= REPOST_WINDOW_SECS + 600):
+                    continue
+            if _content_signature_matches(msg, task.get("content_text"), task["content_type"],
+                                          allow_blind_media=False):
+                if await user.delete_messages(chat_id_int, msg.id):
+                    logger.info(f"🗑 Auto-deleted repost msg {msg.id} (original {message_id} was replaced) in {chat_id_int}")
+                    return 1
+    except Exception as e:
+        logger.warning(f"Auto-delete: repost scan failed in {chat_id_int}: {e}")
+    return 0
+
+async def delete_sent_message(owner_id, chat_id, message_id, task_id=None):
     try:
         session = await get_session(owner_id)
         if not session:
@@ -1342,12 +1374,23 @@ async def delete_sent_message(owner_id, chat_id, message_id):
             if not warmed:
                 logger.warning(f"Auto-delete: could not resolve chat {chat_id}")
                 return
-            await user.delete_messages(chat_id_int, message_id)
-            logger.info(f"🗑 Auto-deleted msg {message_id} in {chat_id}")
+            try:
+                n = await user.delete_messages(chat_id_int, message_id)
+            except errors.MessageIdInvalid:
+                n = 0
+            if n:
+                logger.info(f"🗑 Auto-deleted msg {message_id} in {chat_id}")
+            elif task_id:
+                # Original already gone (replaced by a repost bot) → delete the repost.
+                if not await _auto_delete_find_repost(user, chat_id_int, int(message_id), task_id):
+                    logger.info(f"Auto-delete: msg {message_id} already gone, no repost found")
+            else:
+                logger.info(f"Auto-delete: msg {message_id} already gone")
     except errors.MessageDeleteForbidden:
-        logger.warning(f"Auto-delete forbidden in {chat_id}")
-    except errors.MessageIdInvalid:
-        logger.info(f"Auto-delete: msg {message_id} already gone")
+        logger.warning(
+            f"Auto-delete forbidden in {chat_id} — the account needs the "
+            f"'Delete messages of others' admin right to remove another bot's repost"
+        )
     except errors.PeerIdInvalid:
         logger.warning(f"Auto-delete: invalid chat {chat_id}")
     except Exception as e:
@@ -1523,7 +1566,26 @@ def _normalize_text_for_match(text: str | None) -> str:
     t = re.sub(r"\s+", " ", t).strip().lower()
     return t
 
-_MIN_CONTAINMENT_LEN = 12   # shorter texts must match exactly
+# ─────────────────────────────────────────────────────────────────────────────
+#  REPOST MATCHING ("Safe Mode" / search-proofing channel bots)
+#  Some channel bots delete every new post and re-post it with altered text
+#  (homoglyphs, invisible chars, an added/removed footer or link) and sometimes
+#  a re-uploaded file. AutoCast must recognise that repost as "our" post so
+#  that Pin / Delete Previous act on it.
+#
+#  FIX (regression from round 3): the round-3 matcher required the identical
+#  file and nearly identical text. Real reposts are often re-uploaded and edited,
+#  so they stopped matching, AutoCast kept tracking its own (already removed)
+#  original, and "Delete previous" silently deleted nothing. Content matching
+#  is lenient again (fuzzy text, captions or same file). Protection against
+#  adopting an unrelated post now comes from WHEN the post appeared: a
+#  candidate only counts if our post vanished and it showed up within
+#  REPOST_WINDOW_SECS of ours.
+# ─────────────────────────────────────────────────────────────────────────────
+import difflib
+
+REPOST_WINDOW_SECS = max(30, _env_int("REPOST_WINDOW_SECS", 180))
+_MIN_FUZZY_LEN = 8
 
 def _media_unique_id(msg: Message | None, ct: str) -> str | None:
     if not msg:
@@ -1532,24 +1594,22 @@ def _media_unique_id(msg: Message | None, ct: str) -> str | None:
     return getattr(media, "file_unique_id", None) if media else None
 
 def _text_matches(ours: str, theirs: str) -> bool:
-    """Exact match, or the repost is OUR text plus a small added signature.
-    (The old code also accepted 'their text is inside ours', so a repost of
-    just '🔥' or a link would match almost anything.)"""
+    """Same text, one contains the other, or ≥80 % similar. Very short texts
+    (under 8 chars after normalising) must match exactly."""
     if not ours or not theirs:
         return False
     if ours == theirs:
         return True
-    return len(ours) >= _MIN_CONTAINMENT_LEN and ours in theirs
+    short, long_ = sorted((ours, theirs), key=len)
+    if len(short) < _MIN_FUZZY_LEN:
+        return False
+    if short in long_:
+        return True
+    return difflib.SequenceMatcher(None, ours, theirs, autojunk=False).ratio() >= 0.80
 
 def _content_signature_matches(msg: Message, caption: str | None, ct: str,
-                               sent: Message | None = None) -> bool:
-    """
-    FIX FALSE MATCHES: previously a media post with no caption matched ANY later
-    post of the same media type from anyone, so if our post was removed AutoCast
-    could adopt an unrelated post, pin it, and delete it on the next cycle.
-    Media now has to be the same file (Telegram keeps file_unique_id when a bot
-    re-posts/copies it) or carry our caption; text uses a stricter comparison.
-    """
+                               sent: Message | None = None,
+                               allow_blind_media: bool = True) -> bool:
     try:
         msg_ct = msg.media.value if msg.media else "text"
     except Exception:
@@ -1559,11 +1619,16 @@ def _content_signature_matches(msg: Message, caption: str | None, ct: str,
             return False
         ours_uid   = _media_unique_id(sent, ct)
         theirs_uid = _media_unique_id(msg, ct)
-        if ours_uid and theirs_uid:
-            return ours_uid == theirs_uid
+        if ours_uid and theirs_uid and ours_uid == theirs_uid:
+            return True                     # same file (copied / re-sent)
         our_cap   = _normalize_text_for_match(caption)
         their_cap = _normalize_text_for_match(msg.caption)
-        return _text_matches(our_cap, their_cap)
+        if our_cap and their_cap:
+            return _text_matches(our_cap, their_cap)
+        # Re-uploaded file and a caption missing on one side: same media type
+        # inside the time window is the best signal available (same as the
+        # original behaviour). Not allowed for the window-less cleanup scan.
+        return allow_blind_media
     if ct == "poll":
         poll = getattr(msg, "poll", None)
         if not poll:
@@ -1574,11 +1639,67 @@ def _content_signature_matches(msg: Message, caption: str | None, ct: str,
             our_q = ""
         return _text_matches(_normalize_text_for_match(our_q),
                              _normalize_text_for_match(getattr(poll, "question", "")))
-    # text / link
-    if msg_ct not in ("text", "web_page_preview"):
+    # text / link: a repost of a link may or may not carry a preview
+    if msg.media and msg_ct not in ("web_page_preview", "web_page"):
         return False
     return _text_matches(_normalize_text_for_match(caption),
                          _normalize_text_for_match(msg.text))
+
+def _within_window(msg: Message, ref: Message | None) -> bool:
+    """Was msg posted within REPOST_WINDOW_SECS after ref (our post)?"""
+    try:
+        if ref is None or not ref.date or not msg.date:
+            return True
+        delta = (msg.date - ref.date).total_seconds()
+        return -5 <= delta <= REPOST_WINDOW_SECS
+    except Exception:
+        return True
+
+async def _other_tracked_ids(chat_id, tid: str) -> set[int]:
+    """Message IDs other AutoCast tasks in this channel are tracking — never
+    adopt or delete those as 'our' repost."""
+    try:
+        pool = await get_db()
+        rows = await pool.fetch(
+            "SELECT last_msg_id FROM userbot_tasks_v11 "
+            "WHERE chat_id=$1 AND task_id<>$2 AND last_msg_id IS NOT NULL",
+            str(chat_id), tid
+        )
+        return {int(r["last_msg_id"]) for r in rows}
+    except Exception:
+        return set()
+
+async def _cleanup_orphan_reposts(user_client, target_int: int, old_id: int, new_id: int,
+                                  caption: str | None, ct: str, sent: Message, tid: str) -> int:
+    """
+    Safety net for "Delete previous": the message we tracked last cycle is
+    already gone (a repost bot replaced it after we stopped watching), so its
+    repost is still in the channel. Look only BETWEEN the old tracked message
+    and the post we just sent for reposts of this same content and delete them.
+    """
+    deleted = 0
+    others = await _other_tracked_ids(target_int, tid)
+    try:
+        async for msg in user_client.get_chat_history(target_int, limit=60):
+            if msg.id >= new_id:
+                continue
+            if msg.id <= old_id:
+                break
+            if getattr(msg, "outgoing", False) or getattr(msg, "service", None) or msg.id in others:
+                continue
+            if _content_signature_matches(msg, caption, ct, sent=sent, allow_blind_media=False):
+                try:
+                    n = await user_client.delete_messages(target_int, msg.id)
+                    if n:
+                        deleted += 1
+                        logger.info(f"Job {tid}: deleted previous repost msg {msg.id} (found by content)")
+                except Exception as e:
+                    logger.warning(f"Job {tid}: could not delete previous repost {msg.id}: {e}")
+                if deleted >= 3:
+                    break
+    except Exception as e:
+        logger.warning(f"Job {tid}: previous-repost scan failed: {e}")
+    return deleted
 
 async def _resolve_live_message(user_client, target_int: int, sent: Message,
                                  caption: str | None, ct: str, tid: str) -> int | None:
@@ -1587,7 +1708,9 @@ async def _resolve_live_message(user_client, target_int: int, sent: Message,
     # virtually every real-world case. Two more checks follow (+2s, +3s --
     # i.e. 7s and 10s after sending) purely as a safety net for a slower
     # replacement bot; the 5s check is the one that matters most.
-    for delay in (5.0, 2.0, 3.0):
+    others = await _other_tracked_ids(target_int, tid)
+    # 5 s / 7 s / 10 s as before, plus 20 s and 35 s for slower repost bots.
+    for delay in (5.0, 2.0, 3.0, 10.0, 15.0):
         await asyncio.sleep(delay)
         try:
             check = await user_client.get_messages(target_int, sent.id)
@@ -1604,6 +1727,8 @@ async def _resolve_live_message(user_client, target_int: int, sent: Message,
                 # skipped anything. `outgoing` is set on posts our account made
                 # (e.g. another AutoCast task in the same channel).
                 if getattr(msg, "outgoing", False) or getattr(msg.from_user, "is_self", False):
+                    continue
+                if not _within_window(msg, sent) or msg.id in others:
                     continue
                 if _content_signature_matches(msg, caption, ct, sent=sent):
                     logger.info(
@@ -4602,6 +4727,23 @@ async def _handle_dead_session(owner_id: int, err: Exception):
         "**To fix:** /start → 🔐 Login again, then open /manage and tap ▶️ **Start Engine**."
     )
 
+_delete_perm_notified: set[str] = set()
+
+async def _note_delete_permission_missing(t: dict):
+    key = f"{t['owner_id']}:{t['chat_id']}"
+    if key in _delete_perm_notified:
+        return
+    _delete_perm_notified.add(key)
+    ch = await _channel_label(t["owner_id"], t["chat_id"])
+    await _notify(
+        t["owner_id"],
+        f"⚠️ **Can't delete previous posts in {ch}**\n\n"
+        "Your post is being re-posted by another bot in this channel, and your "
+        "account isn't allowed to delete other admins' messages.\n\n"
+        "**To fix:** Channel → Administrators → your account → turn on "
+        "**Delete messages of others**."
+    )
+
 async def _note_transient_failure(t: dict, reason: str):
     tid = t["task_id"]
     n = _fail_counts.get(tid, 0) + 1
@@ -4938,10 +5080,30 @@ async def _run_job(fresh: dict, attempt: int = 0) -> tuple[str, str]:
             old_id = fresh.get("last_msg_id")
             if fresh["delete_old"] and old_id and int(old_id) != sent.id:
                 try:
-                    await user.delete_messages(target_int, int(old_id))
-                    logger.info(f"Job {tid}: deleted old msg {old_id}")
-                except (errors.MessageDeleteForbidden, errors.MessageIdInvalid):
-                    pass
+                    n_del = await user.delete_messages(target_int, int(old_id))
+                    if n_del:
+                        logger.info(f"Job {tid}: deleted old msg {old_id}")
+                    else:
+                        # The tracked message no longer exists — most likely a
+                        # repost bot replaced it. Find and delete that repost.
+                        logger.info(f"Job {tid}: old msg {old_id} already gone — looking for its repost")
+                        found = await _cleanup_orphan_reposts(
+                            user, target_int, int(old_id), sent.id, caption, ct, sent, tid
+                        )
+                        if not found:
+                            logger.warning(f"Job {tid}: previous post {old_id} not found — nothing to delete")
+                except errors.MessageDeleteForbidden:
+                    logger.warning(
+                        f"Job {tid}: no permission to delete old msg {old_id} — the account "
+                        f"needs the 'Delete messages' admin right in this channel"
+                    )
+                    await _note_delete_permission_missing(fresh)
+                except errors.MessageIdInvalid:
+                    found = await _cleanup_orphan_reposts(
+                        user, target_int, int(old_id), sent.id, caption, ct, sent, tid
+                    )
+                    if not found:
+                        logger.warning(f"Job {tid}: previous post {old_id} not found — nothing to delete")
                 except Exception as e:
                     logger.warning(f"Job {tid}: delete old failed ({e}) — scheduling retry")
                     retry_at = datetime.datetime.now(pytz.utc) + datetime.timedelta(minutes=2)
@@ -4975,7 +5137,7 @@ async def _run_job(fresh: dict, attempt: int = 0) -> tuple[str, str]:
                     try:
                         scheduler.add_job(
                             delete_sent_message, "date", run_date=run_at,
-                            args=[owner, fresh["chat_id"], live_id],
+                            args=[owner, fresh["chat_id"], live_id, tid],
                             id=f"del_{tid}_{live_id}", replace_existing=True, misfire_grace_time=600
                         )
                     except Exception as e:
