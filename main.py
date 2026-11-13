@@ -1339,23 +1339,32 @@ async def _auto_delete_find_repost(user, chat_id_int: int, message_id: int, task
     off_min = int(task.get("auto_delete_offset") or 0)
     sent_est = datetime.datetime.now() - datetime.timedelta(minutes=off_min)  # naive local, like msg.date
     others = await _other_tracked_ids(chat_id_int, task_id)
+    seen = []
     try:
         async for msg in user.get_chat_history(chat_id_int, limit=60):
             if msg.id <= message_id:
                 break
-            if getattr(msg, "outgoing", False) or getattr(msg, "service", None) or msg.id in others:
+            if getattr(msg, "service", None) or msg.id in others:
+                seen.append(_cand_info(msg, note=" skip:other-task" if msg.id in others else " skip:service"))
                 continue
             if msg.date:
                 delta = (msg.date - sent_est).total_seconds()
                 if not (-900 <= delta <= REPOST_WINDOW_SECS + 600):
+                    seen.append(_cand_info(msg, note=" skip:time"))
                     continue
-            if _content_signature_matches(msg, task.get("content_text"), task["content_type"],
-                                          allow_blind_media=False):
+            ok = _content_signature_matches(msg, task.get("content_text"), task["content_type"],
+                                            allow_blind_media=False)
+            seen.append(_cand_info(msg, matched=ok))
+            if ok:
                 if await user.delete_messages(chat_id_int, msg.id):
                     logger.info(f"🗑 Auto-deleted repost msg {msg.id} (original {message_id} was replaced) in {chat_id_int}")
                     return 1
     except Exception as e:
         logger.warning(f"Auto-delete: repost scan failed in {chat_id_int}: {e}")
+    logger.warning(
+        f"Auto-delete [{task_id}]: original {message_id} gone, no repost matched. "
+        f"Candidates: {' '.join(seen[:12]) or 'none'}"
+    )
     return 0
 
 async def delete_sent_message(owner_id, chat_id, message_id, task_id=None):
@@ -1655,6 +1664,23 @@ def _within_window(msg: Message, ref: Message | None) -> bool:
     except Exception:
         return True
 
+def _cand_info(msg, ref_date=None, matched=None, note="") -> str:
+    """One-line description of a candidate repost, for the logs."""
+    try:
+        ct = msg.media.value if msg.media else "text"
+    except Exception:
+        ct = "?"
+    txt = (getattr(msg, "caption", None) or getattr(msg, "text", None) or "")
+    txt = txt.replace("\n", " ")[:25]
+    age = ""
+    try:
+        if ref_date and msg.date:
+            age = f" +{int((msg.date - ref_date).total_seconds())}s"
+    except Exception:
+        pass
+    m = "" if matched is None else (" MATCH" if matched else " no-match")
+    return f"[{msg.id} {ct} out={bool(getattr(msg, 'outgoing', False))}{age}{m}{note} '{txt}']"
+
 async def _other_tracked_ids(chat_id, tid: str) -> set[int]:
     """Message IDs other AutoCast tasks in this channel are tracking — never
     adopt or delete those as 'our' repost."""
@@ -1678,6 +1704,7 @@ async def _cleanup_orphan_reposts(user_client, target_int: int, old_id: int, new
     and the post we just sent for reposts of this same content and delete them.
     """
     deleted = 0
+    seen = []
     others = await _other_tracked_ids(target_int, tid)
     try:
         async for msg in user_client.get_chat_history(target_int, limit=60):
@@ -1685,9 +1712,13 @@ async def _cleanup_orphan_reposts(user_client, target_int: int, old_id: int, new
                 continue
             if msg.id <= old_id:
                 break
-            if getattr(msg, "outgoing", False) or getattr(msg, "service", None) or msg.id in others:
+            # NOTE: no `outgoing` filter here (see _resolve_live_message).
+            if getattr(msg, "service", None) or msg.id in others:
+                seen.append(_cand_info(msg, note=" skip:other-task" if msg.id in others else " skip:service"))
                 continue
-            if _content_signature_matches(msg, caption, ct, sent=sent, allow_blind_media=False):
+            ok = _content_signature_matches(msg, caption, ct, sent=sent, allow_blind_media=False)
+            seen.append(_cand_info(msg, matched=ok))
+            if ok:
                 try:
                     n = await user_client.delete_messages(target_int, msg.id)
                     if n:
@@ -1699,6 +1730,11 @@ async def _cleanup_orphan_reposts(user_client, target_int: int, old_id: int, new
                     break
     except Exception as e:
         logger.warning(f"Job {tid}: previous-repost scan failed: {e}")
+    if not deleted:
+        logger.warning(
+            f"Job {tid}: previous-repost scan between {old_id} and {new_id} found nothing. "
+            f"Candidates: {' '.join(seen[:12]) or 'none'}"
+        )
     return deleted
 
 async def _resolve_live_message(user_client, target_int: int, sent: Message,
@@ -1709,6 +1745,7 @@ async def _resolve_live_message(user_client, target_int: int, sent: Message,
     # i.e. 7s and 10s after sending) purely as a safety net for a slower
     # replacement bot; the 5s check is the one that matters most.
     others = await _other_tracked_ids(target_int, tid)
+    seen: list[str] = []
     # 5 s / 7 s / 10 s as before, plus 20 s and 35 s for slower repost bots.
     for delay in (5.0, 2.0, 3.0, 10.0, 15.0):
         await asyncio.sleep(delay)
@@ -1719,18 +1756,27 @@ async def _resolve_live_message(user_client, target_int: int, sent: Message,
         except Exception:
             pass
         try:
+            seen = []
+            others = await _other_tracked_ids(target_int, tid)   # refresh: sibling posts may be new
             async for msg in user_client.get_chat_history(target_int, limit=15):
                 if msg.id <= sent.id:
                     break  # nothing newer than our own post yet
-                # FIX: in channels posts have no from_user (they come from the
-                # channel itself), so the old from_user.is_self check never
-                # skipped anything. `outgoing` is set on posts our account made
-                # (e.g. another AutoCast task in the same channel).
-                if getattr(msg, "outgoing", False) or getattr(msg.from_user, "is_self", False):
+                # FIX (round 6): round 3 skipped posts flagged `outgoing` here,
+                # assuming only our own account's posts carry that flag. In
+                # channels the repost bot's posts can carry it too, which hid
+                # every repost — so Pin / Delete previous / Auto-delete lost
+                # track of the post. The original code never filtered these
+                # out either. Other AutoCast tasks' posts are still excluded
+                # through `others` (their tracked message IDs).
+                if msg.id in others:
+                    seen.append(_cand_info(msg, sent.date, note=" skip:other-task"))
                     continue
-                if not _within_window(msg, sent) or msg.id in others:
+                if not _within_window(msg, sent):
+                    seen.append(_cand_info(msg, sent.date, note=" skip:time"))
                     continue
-                if _content_signature_matches(msg, caption, ct, sent=sent):
+                ok = _content_signature_matches(msg, caption, ct, sent=sent)
+                seen.append(_cand_info(msg, sent.date, matched=ok))
+                if ok:
                     logger.info(
                         f"Job {tid}: original msg {sent.id} was replaced by "
                         f"another bot/account — now tracking msg {msg.id} instead"
@@ -1739,7 +1785,8 @@ async def _resolve_live_message(user_client, target_int: int, sent: Message,
         except Exception as e:
             logger.warning(f"Job {tid}: replacement scan failed: {e}")
     logger.warning(
-        f"Job {tid}: msg {sent.id} vanished and no replacement was found after polling"
+        f"Job {tid}: msg {sent.id} vanished and no replacement was found after polling. "
+        f"Last scan candidates: {' '.join(seen[:12]) or 'none (nothing newer than our post)'}"
     )
     return None
 
